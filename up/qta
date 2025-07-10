@@ -1,0 +1,624 @@
+# -*- coding: utf-8 -*-
+import sys
+import cv2
+import os
+os.environ['QT_QPA_PLATFORM'] = 'xcb'
+import time
+import random
+#import Adafruit_DHT
+from pathlib import Path
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QPushButton, QLabel, QFileDialog, QSizePolicy, QSlider,
+                             QMessageBox, QFrame, QStackedWidget, QGridLayout,QTextEdit, QScrollArea)
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QFileSystemWatcher
+from PyQt6.QtGui import QImage, QPixmap, QIcon, QFont, QPainter, QColor
+
+yolo111_dir = "/home/elf/CW/rknn_model_zoo/examples/yolo11/python/"
+sys.path.append(yolo111_dir)
+from yolo111 import process_image
+sys.path.append("/home/elf/CW/rknn_model_zoo/examples/yolo11/python")
+from aaa1 import setup_model, post_process, draw, IMG_SIZE, CLASSES
+
+
+class FixedSizeDisplayWidget(QLabel):
+    """支持原始比例显示的组件"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("""
+            background-color: #e0e0e0;
+            border: 1px solid #c0c0c0;
+        """)
+        self._pixmap = QPixmap()
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.sensor_overlay = None  # 用于存储传感器信息覆盖层
+
+    def setPixmap(self, pixmap):
+        if pixmap is not None and not pixmap.isNull():
+            self._pixmap = pixmap
+            self.update_pixmap()
+        else:
+            self._pixmap = QPixmap()
+            super().setPixmap(self._pixmap)
+
+    def update_pixmap(self):
+        if not self._pixmap.isNull():
+            target_width = self.width()
+            target_height = int(target_width * 9 / 16)
+            
+            if target_height > self.height():
+                target_height = self.height()
+                target_width = int(target_height * 16 / 9)
+                
+            scaled_pixmap = self._pixmap.scaled(
+                target_width, target_height,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            
+            # 如果有传感器覆盖层，将其绘制到图像上
+            if self.sensor_overlay and isinstance(self.sensor_overlay, QPixmap):
+                painter = QPainter(scaled_pixmap)
+                painter.drawPixmap(10, 10, self.sensor_overlay)
+                painter.end()
+            
+            super().setPixmap(scaled_pixmap)
+        else:
+            super().setPixmap(self._pixmap)
+
+    def resizeEvent(self, event):
+        self.update_pixmap()
+        super().resizeEvent(event)
+
+    def update_sensor_overlay(self, temp, pressure):
+        """更新传感器信息覆盖层,从GPIO读取的真实数据"""
+        if temp is None and pressure is None:
+            self.sensor_overlay = None
+            self.update_pixmap()
+            return
+            
+        overlay = QPixmap(220, 80)
+        overlay.fill(Qt.GlobalColor.transparent)
+        
+        painter = QPainter(overlay)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # 绘制文字
+        font = QFont()
+        font.setPointSize(12)
+        font.setBold(True)
+        painter.setFont(font)
+
+         # 绘制温度和水压信息
+        painter.setPen(QColor(0, 0, 0))  
+        if temp is not None:
+            painter.drawText(11, 26, f"温度: {temp:.1f}°C")
+        if pressure is not None:
+            painter.drawText(11, 56, f"水压: {pressure:.1f}MPa")
+        
+        painter.setPen(QColor(255, 255, 255))  
+        if temp is not None:
+            painter.drawText(10, 25, f"温度: {temp:.1f}°C")
+        if pressure is not None:
+            painter.drawText(10, 55, f"水压: {pressure:.1f}MPa")
+        
+        painter.end()
+        self.sensor_overlay = overlay
+        self.update_pixmap()
+
+class ImageButton(QWidget):
+    """图片按钮组件，包含图标和说明文字"""
+    clicked = pyqtSignal()
+    
+    def __init__(self, icon_path, text, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(80, 80)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        
+        self.btn = QPushButton()
+        self.btn.setFlat(True)
+        self.btn.setIconSize(QSize(48, 48))
+        self.set_icon(icon_path)
+        self.btn.clicked.connect(self.clicked.emit)
+        layout.addWidget(self.btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        
+        self.label = QLabel(text)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setStyleSheet("font-size: 9px; color: #333333;")
+        self.label.setWordWrap(True)
+        layout.addWidget(self.label)
+        
+    def set_icon(self, icon_path):
+        if Path(icon_path).exists():
+            icon = QIcon(icon_path)
+            self.btn.setIcon(icon)
+
+class YOLODetectionUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("水下生物检测系统")
+        self.setFixedSize(950, 570)
+        
+        # 初始化模型和状态
+        self.model = None
+        self.camera = None
+        self.camera_timer = QTimer(self)
+        self.camera_timer.timeout.connect(self.update_camera_frame)
+        self.captured_image = None
+        self.realtime_detecting = False
+        self.image_path = None
+        
+        # 传感器参数
+        self.sensor_timer = QTimer(self)
+        self.sensor_timer.timeout.connect(self.read_sensor_data)
+        self.current_temp = None
+        self.current_pressure = None
+        self.show_sensors = False  
+
+        # 文件系统监视器
+        self.file_watcher = QFileSystemWatcher()
+        info_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "information.txt")
+        self.file_watcher.addPath(info_file)
+        self.file_watcher.fileChanged.connect(self.update_info_box)
+
+        # 添加文本框更新定时器
+        self.info_timer = QTimer(self)
+        self.info_timer.timeout.connect(self.update_info_box)
+        self.info_timer.start(500)  
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        main_widget = QWidget()
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # 顶部控制栏 (白色背景)
+        top_bar = QWidget()
+        top_bar.setFixedHeight(100)
+        top_bar.setStyleSheet("background-color: white;")
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(0,0,0,0)
+
+        # 左侧容器 - logo和队伍名称
+        left_container = QWidget()
+        left_container.setFixedWidth(120)
+        left_container_layout = QVBoxLayout(left_container)
+        left_container_layout.setContentsMargins(5, 5, 5, 5)
+        left_container_layout.setSpacing(0)
+        
+        # 左上角logo
+        self.logo_label = QLabel()
+        self.logo_label.setFixedSize(120, 100)
+        self.logo_path = "images/logo.png"
+        self.update_logo()
+        left_container_layout.addWidget(self.logo_label, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        top_layout.addWidget(left_container, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        # 中央按钮区域
+        button_container = QWidget()
+        self.button_layout = QHBoxLayout(button_container)
+        self.button_layout.setContentsMargins(0, 0, 0, 0)
+        self.button_layout.setSpacing(15)
+
+        buttons = [
+             ("icons/image.jpg", "图片检测", self.open_image),
+             ("icons/realtime.jpg", "实时检测", self.toggle_realtime_detection),
+             ("icons/camera_open.jpg", "打开摄像头", self.toggle_camera),
+             ("icons/detect.jpg", "开始检测", self.start_detection),
+             ("icons/capture.jpg", "拍摄照片", self.capture_image)
+        ]
+    
+        for icon, text, slot in buttons[:2]:
+             btn = ImageButton(icon, text)
+             btn.clicked.connect(slot)
+             if text == "实时检测":
+                self.realtime_btn = btn
+             self.button_layout.addWidget(btn)
+
+        self.camera_btn = ImageButton(buttons[2][0], buttons[2][1])
+        self.camera_btn.clicked.connect(buttons[2][2])
+        self.button_layout.addWidget(self.camera_btn)
+
+        for icon, text, slot in buttons[3:]:
+             btn = ImageButton(icon, text)
+             btn.clicked.connect(slot)
+             if text == "拍摄照片":
+                 self.capture_btn = btn
+                 btn.setEnabled(False)
+             self.button_layout.addWidget(btn)
+    
+        top_layout.addStretch(1)
+        top_layout.addWidget(button_container, 0)
+        top_layout.addStretch(1)
+        
+        # 右上角信息文本框
+        self.info_box = QTextEdit()
+        self.info_box.setFixedSize(180, 80)
+        self.info_box.setReadOnly(True)
+        self.info_box.setStyleSheet("""
+            QTextEdit {
+                background-color: #f8f8f8;
+                border: 1px solid #d0d0d0;
+                border-radius: 5px;
+                font-size: 10px;
+                padding: 5px;
+            }
+        """)
+        top_layout.addWidget(self.info_box, 0, Qt.AlignmentFlag.AlignRight)
+    
+        main_layout.addWidget(top_bar)
+
+        # 主显示区域 (浅灰色背景)
+        display_area = QWidget()
+        display_area.setStyleSheet("background-color: #f0f0f0;")
+        self.display_layout = QStackedWidget()
+        
+        # 单显示模式（摄像头/实时检测） - 使用滚动区域
+        self.single_display = FixedSizeDisplayWidget()
+        single_widget = QWidget()
+        single_layout = QVBoxLayout(single_widget)
+        single_layout.setContentsMargins(10, 10, 10, 10)
+        single_layout.addWidget(self.single_display)
+        self.display_layout.addWidget(single_widget)
+        
+        # 双显示模式（图片检测）
+        dual_widget = QWidget()
+        dual_layout = QHBoxLayout(dual_widget)
+        dual_layout.setContentsMargins(10, 10, 10, 10)
+        dual_layout.setSpacing(15)
+        
+        self.original_display = FixedSizeDisplayWidget()
+        dual_layout.addWidget(self.original_display)
+        
+        self.result_display = FixedSizeDisplayWidget()
+        dual_layout.addWidget(self.result_display)
+        
+        self.display_layout.addWidget(dual_widget)
+        self.display_layout.setCurrentIndex(0)
+        
+        display_area_layout = QVBoxLayout(display_area)
+        display_area_layout.addWidget(self.display_layout)
+        main_layout.addWidget(display_area, 1)
+        
+        self.setCentralWidget(main_widget)
+    
+    def read_sensor_data(self):
+        """从GPIO读取传感器数据"""
+        try:
+            # 读取温度传感器
+            self.current_temp = read_temperature_from_gpio()
+            
+            # 读取水压传感器
+            self.current_pressure = read_pressure_from_gpio()
+            
+            self.current_temp = None
+            self.current_pressure = None
+            
+            # 如果有数据则更新显示
+            if self.show_sensors and (self.current_temp is not None or self.current_pressure is not None):
+                self.single_display.update_sensor_overlay(self.current_temp, self.current_pressure)
+            elif self.show_sensors:
+                self.single_display.update_sensor_overlay(None, None)
+                
+        except Exception as e:
+            print(f"读取传感器数据出错: {e}")
+            self.current_temp = None
+            self.current_pressure = None
+
+    
+    def update_logo(self):
+        if Path(self.logo_path).exists():
+            pixmap = QPixmap(self.logo_path)
+            self.logo_label.setPixmap(pixmap.scaled(
+                self.logo_label.size(), 
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            ))
+
+    def open_image(self):
+        """打开图片文件"""
+        self.reset_media_state()
+        self.display_layout.setCurrentIndex(1)
+        
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择图片", "",
+            "图片文件(*.jpg *.jpeg *.png *.bmp *.tiff)"
+        )
+        if file_path:
+            self.image_path = file_path
+            image = cv2.imread(file_path)
+            if image is not None:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                self.display_media(self.original_display, image)
+                self.result_display.clear()
+
+    def toggle_camera(self):
+        """切换摄像头状态"""
+        if self.camera is None:
+            self.start_camera()
+            if self.camera is not None:
+                self.camera_btn.set_icon("icons/camera_close.jpg")
+                self.camera_btn.label.setText("关闭摄像头")
+                self.capture_btn.setEnabled(True)
+                self.display_layout.setCurrentIndex(0)
+                self.show_sensors = True
+                self.sensor_timer.start(1000)  # 每秒更新一次传感器数据
+        else:
+            self.stop_camera()
+            self.camera_btn.set_icon("icons/camera_open.jpg")
+            self.camera_btn.label.setText("打开摄像头")
+            self.capture_btn.setEnabled(False)
+            self.stop_realtime_detection()
+            self.show_sensors = False
+            self.sensor_timer.stop()
+
+    def start_camera(self):
+        """启动摄像头"""
+        for dev in [21, 22, 23, 24, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+            self.camera = cv2.VideoCapture(f'/dev/video{dev}')
+            if self.camera.isOpened():
+                print(f"成功打开摄像头 /dev/video{dev}")
+                self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+                self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+                break
+
+        if self.camera.isOpened():
+            self.camera_timer.start(30)
+        else:
+            QMessageBox.warning(self, "错误", "无法打开任何摄像头")
+            self.camera = None
+
+    def stop_camera(self):
+        """停止摄像头"""
+        if self.camera is not None:
+            self.camera_timer.stop()
+            self.camera.release()
+            self.camera = None
+            self.single_display.clear()
+
+    def update_camera_frame(self):
+        """更新摄像头画面"""
+        if self.camera is None:
+            return
+            
+        ret, frame = self.camera.read()
+        if not ret:
+            return
+        
+        h, w = frame.shape[:2]
+        target_aspect = 16/9
+        current_aspect = w/h
+        
+        if current_aspect > target_aspect:
+            new_width = int(h * target_aspect)
+            left = (w - new_width) // 2
+            frame = frame[:, left:left+new_width]
+        elif current_aspect < target_aspect:
+            new_height = int(w / target_aspect)
+            top = (h - new_height) // 2
+            frame = frame[top:top+new_height, :]
+        
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        if self.realtime_detecting:
+            detected_frame = self.detect_with_yolo(frame_rgb.copy())
+            self.display_media(self.single_display, detected_frame)
+        else:
+            self.display_media(self.single_display, frame_rgb)
+
+    def toggle_realtime_detection(self):
+        """切换实时检测状态"""
+        if not self.realtime_detecting:
+            if self.camera is None:
+                self.start_camera()
+                self.camera_btn.label.setText("关闭摄像头")
+                self.capture_btn.setEnabled(True)
+                self.show_sensors = True
+                self.sensor_timer.start(1000)
+            
+            if self.camera is not None and self.camera.isOpened():
+                self.realtime_detecting = True
+                self.realtime_btn.label.setText("停止检测")
+                self.info_timer.start(1000)
+        else:
+            self.realtime_detecting = False
+            self.realtime_btn.label.setText("实时检测")
+            self.info_timer.stop()
+
+    def update_info_box(self):
+        """更新信息文本框内容"""
+        try:
+            info_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                      "/home/elf/CW/rknn_model_zoo/examples/yolo11/python/information.txt")
+            print(f"尝试读取文件: {info_file}")
+        
+            if os.path.exists(info_file):
+                with open(info_file, 'r') as f:
+                    content = f.read()
+                    self.info_box.setText(content)
+                    scroll_bar = self.info_box.verticalScrollBar()
+                    scroll_bar.setValue(scroll_bar.maximum())
+                print(f"读取到内容: {content}")
+            else:
+                self.info_box.setText("信息文件不存在")
+                print("信息文件不存在")
+        except Exception as e:
+            error_msg = f"读取信息出错: {str(e)}"
+            self.info_box.setText(error_msg)
+            print(error_msg)
+
+    def capture_image(self):
+        """拍摄照片"""
+        if self.camera is not None:
+            ret, frame = self.camera.read()
+            if ret:
+                self.captured_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                save_dir = "captured_images"
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir)
+            
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                save_path = os.path.join(save_dir, f"captured_{timestamp}.jpg")
+            
+                cv2.imwrite(save_path, cv2.cvtColor(self.captured_image, cv2.COLOR_RGB2BGR))
+            
+                QMessageBox.information(self, "提示", f"照片已拍摄并保存到: {save_path}")
+
+    def initialize_model(self):
+        """初始化YOLO模型"""
+        try:
+            import argparse
+            args = argparse.Namespace(
+                model_path="/home/elf/CW/rknn_model_zoo/examples/yolo11/model/yolo11.rknn",
+                target="rk3588",
+                device_id=None
+            )
+            self.model, _ = setup_model(args)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"模型初始化失败: {str(e)}")
+            self.model = None
+
+    def start_detection(self):
+        """开始检测"""
+        if hasattr(self, 'image_path') and self.image_path:
+            image = cv2.imread(self.image_path)
+            if image is not None:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                detected_image = self.detect_with_yolo(image.copy())
+                self.display_media(self.result_display, detected_image)
+        elif hasattr(self, 'captured_image') and self.captured_image is not None:
+            detected_image = self.detect_with_yolo(self.captured_image.copy())
+            self.display_media(self.result_display, detected_image)
+
+    def detect_with_yolo(self, frame):
+        """使用YOLO进行目标检测"""
+        if not hasattr(self, 'model') or self.model is None:
+            self.initialize_model()
+            if not hasattr(self, 'model') or self.model is None:
+                return frame
+    
+        # 1. 保存原始尺寸和比例
+        original_h, original_w = frame.shape[:2]
+        original_aspect = original_w / original_h
+
+         # 2. 将图片调整为16:9
+        target_aspect = 16/9
+        if original_aspect > target_aspect:
+             # 图片比16:9宽，调整高度
+             new_h = int(original_w / target_aspect)
+             frame = cv2.copyMakeBorder(frame, 
+                                 (new_h - original_h)//2, 
+                                 (new_h - original_h)//2, 
+                                 0, 0, 
+                                 cv2.BORDER_CONSTANT, 
+                                 value=(0,0,0))
+        elif original_aspect < target_aspect:
+             # 图片比16:9窄，调整宽度
+             new_w = int(original_h * target_aspect)
+             frame = cv2.copyMakeBorder(frame, 
+                                 0, 0, 
+                                 (new_w - original_w)//2, 
+                                 (new_w - original_w)//2, 
+                                 cv2.BORDER_CONSTANT, 
+                                 value=(0,0,0))
+
+        # 3. 转换为BGR并调整到模型输入尺寸
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        img = cv2.resize(frame_bgr, (IMG_SIZE[0], IMG_SIZE[1]))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        try:
+            model_type = getattr(self.model, 'platform', None)
+        
+            if model_type in ['pytorch', 'onnx']:
+                input_data = img.transpose((2, 0, 1))
+                input_data = input_data.reshape(1, *input_data.shape).astype(np.float32)
+                input_data = input_data / 255.
+            else:
+                input_data = img
+
+            outputs = self.model.run([input_data])
+            boxes, classes, scores = post_process(outputs)
+        
+            if boxes is not None:
+                detected_frame = frame_bgr.copy()
+                
+                # 4. 将检测框坐标缩放回16:9的图片尺寸
+                scale_x = frame_bgr.shape[1] / IMG_SIZE[0]
+                scale_y = frame_bgr.shape[0] / IMG_SIZE[1]
+
+                # 缩放检测框
+                scaled_boxes = []
+                for box in boxes:
+                     x1, y1, x2, y2 = box
+                     scaled_boxes.append([
+                         int(x1 * scale_x),
+                         int(y1 * scale_y),
+                         int(x2 * scale_x),
+                         int(y2 * scale_y)
+                     ])
+
+                draw(detected_frame, scaled_boxes, scores, classes)
+            
+                 # 5. 转换回RGB并裁剪回原始比例
+                detected_frame = cv2.cvtColor(detected_frame, cv2.COLOR_BGR2RGB)
+
+                 # 裁剪掉之前添加的黑色边框
+                if original_aspect > target_aspect:
+                     new_h = int(original_w / target_aspect)
+                     offset = (new_h - original_h)//2
+                     detected_frame = detected_frame[offset:offset+original_h, :]
+                elif original_aspect < target_aspect:
+                     new_w = int(original_h * target_aspect)
+                     offset = (new_w - original_w)//2
+                     detected_frame = detected_frame[:, offset:offset+original_w]
+            
+            return detected_frame
+
+
+        except Exception as e:
+            print(f"检测过程中出错: {e}")
+    
+        return frame
+
+    def display_media(self, display_widget, frame, keep_original=False):
+        """显示媒体内容"""
+        if frame is not None:
+            h, w, ch = frame.shape
+            bytes_per_line = ch * w
+            q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img)
+            display_widget.setPixmap(pixmap)
+
+    def reset_media_state(self):
+        """重置媒体状态"""
+        self.stop_camera()
+        self.stop_realtime_detection()
+        self.show_sensors = False
+        self.sensor_timer.stop()
+
+    def stop_realtime_detection(self):
+        """停止实时检测"""
+        self.realtime_detecting = False
+        if hasattr(self, 'realtime_btn'):
+            self.realtime_btn.label.setText("实时检测")
+
+    def closeEvent(self, event):
+        """关闭窗口时释放资源"""
+        self.stop_realtime_detection()
+        if self.model is not None:
+            self.model.release()
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = YOLODetectionUI()
+    window.show()
+    sys.exit(app.exec())
