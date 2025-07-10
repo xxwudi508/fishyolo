@@ -1,0 +1,23 @@
+## 数据集路径
+#
+## Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+#path: /home/data/home/usr05/ELF/AI3588-master/yolo11/ultralytics_yolo11/datasets
+#train: /home/data/home/usr05/ELF/AI3588-master/yolo11/ultralytics_yolo11/datasets/images/train
+#val: /home/data/home/usr05/ELF/AI3588-master/yolo11/ultralytics_yolo11/datasets/images/val
+#
+## 类别信息
+#nc: 2  # 类别数量
+#names: ['Fish', 'Turtle']  # 类别名称
+
+
+
+# 数据集路径
+
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+path: /home/data/home/usr05/ELF/AI3588-master/yolo11/ultralytics_yolo11/datasets/yolo_data1
+train: /home/data/home/usr05/ELF/AI3588-master/yolo11/ultralytics_yolo11/datasets/yolo_data1/images/train
+val: /home/data/home/usr05/ELF/AI3588-master/yolo11/ultralytics_yolo11/datasets/yolo_data1/images/val
+
+# 类别信息
+nc: 3  # 类别数量
+names: ['Crucian Carp', 'Red-Eared Slider', 'Suckermouth catfish']  # 类别名称
